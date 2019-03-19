@@ -1,4 +1,6 @@
 /* Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
+>>>>>>> 46f6209945e0... Kernel: Xiaomi kernel changes for Redmi go
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and

@@ -1,4 +1,5 @@
 /* Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -1937,6 +1938,10 @@ static int __ipa_mdfy_rt_rule(struct ipa_rt_rule_mdfy *rtrule)
 	if (entry->cookie != IPA_RT_RULE_COOKIE) {
 		IPAERR_RL("bad params\n");
 		goto error;
+	}
+	if (!strcmp(entry->tbl->name, IPA_DFLT_RT_TBL_NAME)) {
+		IPAERR_RL("Default tbl rule cannot be modified\n");
+		return -EINVAL;
 	}
 
 	if (!strcmp(entry->tbl->name, IPA_DFLT_RT_TBL_NAME)) {
