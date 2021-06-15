@@ -564,6 +564,7 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 {
 	struct snd_soc_codec *codec = mbhc->codec;
 	bool is_pa_on = false;
+	int ret;
 
 	WCD_MBHC_RSC_ASSERT_LOCKED(mbhc);
 
@@ -572,6 +573,23 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 	if (!insertion) {
 		/* Report removal */
 		mbhc->hph_status &= ~jack_type;
+		if (mbhc->ptt_supported) {
+			atomic64_set(&ptt_release_ts, 0);
+			atomic64_set(&ptt_press_ts, 0);
+			atomic_set(&ptt_release_ts, 0);
+			atomic_set(&ptt_press_ts, 0);
+			pinctrl_select_state(ptt_btn_pinctrl,
+					ptt_btn_state_suspend);
+			gpio_set_value(mbhc->headset_sel, 0);
+			gpio_set_value(mbhc->audio_sw, 0);
+			if (inserted_headset_ptt) {
+				cancel_delayed_work(&g_mbhc->mbhc_ptt_btn_dwork);
+				disable_irq_wake(gpio_to_irq(mbhc->ptt_btn));
+				free_irq(gpio_to_irq(mbhc->ptt_btn), mbhc);
+				mbhc->hph_status &= ~SND_JACK_PTTHEADSET;
+			}
+			inserted_headset_ptt = false;
+		}
 		/*
 		 * cancel possibly scheduled btn work and
 		 * report release if we reported button press
@@ -614,6 +632,37 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 		hphlocp_off_report(mbhc, SND_JACK_OC_HPHL);
 		mbhc->current_plug = MBHC_PLUG_TYPE_NONE;
 	} else {
+		if (mbhc->ptt_supported) {
+			pinctrl_select_state(ptt_btn_pinctrl,
+					ptt_btn_state_active);
+			/* 56 to select path */
+			gpio_set_value(mbhc->headset_sel, 1);
+			/* 58 enable switch high */
+			gpio_set_value(mbhc->audio_sw, 1);
+			/* Sleep for 180 ms to allow the gpio sets above to take
+			effect before reading mbhc->ptt_btn */
+			msleep(180);
+			pr_debug("%s:%d ptt btn state:%d\n", __func__, __LINE__,
+				gpio_get_value(mbhc->ptt_btn));
+			if (gpio_get_value(mbhc->ptt_btn)) {
+				if (!inserted_headset_ptt) {
+					ret = request_irq(gpio_to_irq(mbhc->ptt_btn),
+						ptt_btn_handler, IRQF_TRIGGER_FALLING | IRQF_NO_SUSPEND
+						| IRQF_ONESHOT | IRQF_TRIGGER_RISING, "ptt_btn_int", mbhc);
+					enable_irq_wake(gpio_to_irq(mbhc->ptt_btn));
+					inserted_headset_ptt = true;
+				}
+			} else {
+				if (inserted_headset_ptt) {
+					cancel_delayed_work_sync(&g_mbhc->mbhc_ptt_btn_dwork);
+					disable_irq_wake(gpio_to_irq(mbhc->ptt_btn));
+					free_irq(gpio_to_irq(mbhc->ptt_btn), mbhc);
+				}
+				/* 56 to select path */
+				gpio_set_value(mbhc->headset_sel, 0);
+				inserted_headset_ptt = false;
+			}
+		}
 		/*
 		 * Report removal of current jack type.
 		 * Headphone to headset shouldn't report headphone
@@ -686,6 +735,10 @@ static void wcd_mbhc_report_plug(struct wcd_mbhc *mbhc, int insertion,
 			mbhc->current_plug = MBHC_PLUG_TYPE_HIGH_HPH;
 		} else if (jack_type == SND_JACK_ANC_HEADPHONE)
 			mbhc->current_plug = MBHC_PLUG_TYPE_ANC_HEADPHONE;
+		if (mbhc->ptt_supported && inserted_headset_ptt) {
+			mbhc->hph_status &= ~jack_type;
+			mbhc->hph_status |= SND_JACK_PTTHEADSET;
+		}
 
 		if (mbhc->mbhc_cb->hph_pa_on_status)
 			is_pa_on = mbhc->mbhc_cb->hph_pa_on_status(codec);
@@ -1565,7 +1618,7 @@ static void wcd_mbhc_detect_plug_type(struct wcd_mbhc *mbhc)
 
 static void wcd_mbhc_swch_irq_handler(struct wcd_mbhc *mbhc)
 {
-	bool detection_type;
+	bool detection_type = false;
 	bool micbias1 = false;
 	struct snd_soc_codec *codec = mbhc->codec;
 
@@ -2205,8 +2258,13 @@ static int wcd_mbhc_initialise(struct wcd_mbhc *mbhc)
 	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_HS_L_DET_PULL_UP_COMP_CTRL, 1);
 	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_L_DET_EN, 1);
 
-	/* Insertion debounce set to 96ms */
-	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_INSREM_DBNC, 6);
+	if (mbhc->ptt_supported)
+		/* Insertion debounce set to 192ms */
+		WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_INSREM_DBNC, 12);
+	else
+		/* Insertion debounce set to 96ms */
+		WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_INSREM_DBNC, 6);
+
 	/* Button Debounce set to 16ms */
 	WCD_MBHC_REG_UPDATE_BITS(WCD_MBHC_BTN_DBNC, 2);
 
@@ -2467,6 +2525,28 @@ int wcd_mbhc_init(struct wcd_mbhc *mbhc, struct snd_soc_codec *codec,
 		goto err;
 	}
 
+/*	pinctrl_select_state(ptt_btn_pinctrl, ptt_btn_state_active); */
+	if (of_property_read_bool(card->dev->of_node, "qcom,ptt_supported")) {
+		mbhc->ptt_supported = true;
+
+		ptt_btn_get_pinctrl_configs(card);
+		mbhc->ptt_btn = of_get_named_gpio(card->dev->of_node,
+					"qcom,ptt-btn-gpio", 0);
+		if (gpio_is_valid(mbhc->ptt_btn))
+			gpio_request_one(mbhc->ptt_btn, GPIOF_DIR_IN, "ptt_btn");
+		mbhc->audio_sw = of_get_named_gpio(card->dev->of_node,
+					"qcom,audio-switch-gpio", 0);
+		if (gpio_is_valid(mbhc->audio_sw))
+			gpio_request_one(mbhc->audio_sw,
+				GPIOF_DIR_OUT | GPIOF_INIT_LOW, "audio_sw");
+		mbhc->headset_sel = of_get_named_gpio(card->dev->of_node,
+					"qcom,headset-sel-gpio", 0);
+		if (gpio_is_valid(mbhc->headset_sel))
+			gpio_request_one(mbhc->headset_sel,
+				GPIOF_DIR_OUT | GPIOF_INIT_LOW, "headset_sel");
+	} else {
+		mbhc->ptt_supported = false;
+	}
 	mbhc->in_swch_irq_handler = false;
 	mbhc->current_plug = MBHC_PLUG_TYPE_NONE;
 	mbhc->is_btn_press = false;
@@ -2534,6 +2614,11 @@ int wcd_mbhc_init(struct wcd_mbhc *mbhc, struct snd_soc_codec *codec,
 		INIT_DELAYED_WORK(&mbhc->mbhc_firmware_dwork,
 				  wcd_mbhc_fw_read);
 		INIT_DELAYED_WORK(&mbhc->mbhc_btn_dwork, wcd_btn_lpress_fn);
+		if (mbhc->ptt_supported) {
+			register_ptt_btn();
+			INIT_DELAYED_WORK(&mbhc->mbhc_ptt_btn_dwork,
+						wcd_ptt_btn_fn);
+		}
 	}
 	mutex_init(&mbhc->hphl_pa_lock);
 	mutex_init(&mbhc->hphr_pa_lock);
@@ -2626,7 +2711,7 @@ int wcd_mbhc_init(struct wcd_mbhc *mbhc, struct snd_soc_codec *codec,
 		       mbhc->intr_ids->hph_right_ocp);
 		goto err_hphr_ocp_irq;
 	}
-
+	g_mbhc = mbhc;
 	pr_debug("%s: leave ret %d\n", __func__, ret);
 	return ret;
 

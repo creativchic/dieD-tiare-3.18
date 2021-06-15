@@ -336,6 +336,7 @@
 #define KEY_RFKILL		247	/* Key that controls all radios */
 
 #define KEY_MICMUTE		248	/* Mute / unmute the microphone */
+#define KEY_PTTBTN      249 /* PTT HEADSET Button */
 
 /*Bug 383266 tangshouxing add for miui headset key function begin*/
 #define KEY_NEXTSONG_NEW        250

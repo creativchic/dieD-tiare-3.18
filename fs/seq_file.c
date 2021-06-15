@@ -70,8 +70,6 @@ int seq_open(struct file *file, const struct seq_operations *op)
 	mutex_init(&p->lock);
 	p->op = op;
 
-
-
 	p->file = file;
 
 	/*
